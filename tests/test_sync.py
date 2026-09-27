@@ -71,6 +71,16 @@ class SyncTest(unittest.TestCase):
         head = text.split('menuentry "LLM Server"')[1]
         self.assertIn("loader  /0123/6.18.48-gentoo-dist-bin/linux", head)
 
+    def test_systemd_boot_auto_entries(self):
+        conf = self.esp / "loader/loader.conf"
+        conf.write_text("timeout 3\nauto-entries yes\n")
+        writer = self.sync.Writer(dry_run=False)
+        self.sync.systemd_boot_auto_entries(self.esp, "no", writer)
+        self.assertEqual(conf.read_text(), "timeout 3\nauto-entries no\n")
+        writer = self.sync.Writer(dry_run=False)
+        self.sync.systemd_boot_auto_entries(self.esp, "no", writer)
+        self.assertEqual(writer.changed, [])
+
     def test_second_run_changes_nothing(self):
         self.sync.REFIND_EFI = ROOT / "tests/fake-refind.efi"
         self.sync.REFIND_EFI.write_bytes(b"MZ fake")

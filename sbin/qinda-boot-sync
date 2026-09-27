@@ -38,6 +38,7 @@ DEFAULTS = {
     "DEFAULT_MODE": "qindaqt",
     "SPLASH_OPTIONS": "quiet splash loglevel=3 rd.udev.log_level=3 systemd.show_status=auto rd.systemd.show_status=auto",
     "RESOLUTION": "max",
+    "SYSTEMD_BOOT_AUTO_ENTRIES": "no",
 }
 
 QUIET = False
@@ -270,6 +271,17 @@ class Writer:
                         path.unlink()
 
 
+def systemd_boot_auto_entries(esp: Path, setting: str, writer: "Writer") -> None:
+    """Keep systemd-boot (the Advanced row) from listing auto-detected foreign
+    loaders, such as a leftover Windows Boot Manager, unless asked to."""
+    conf = esp / "loader" / "loader.conf"
+    if setting == "keep" or not conf.exists():
+        return
+    lines = [l for l in conf.read_text().splitlines() if not re.match(r"\s*auto-entries\b", l)]
+    lines.append(f"auto-entries {setting}")
+    writer.text(conf, "\n".join(lines) + "\n")
+
+
 # ------------------------------------------------------------------- nvram --
 def esp_disk_part(esp: Path) -> tuple[str, str]:
     source = subprocess.run(["findmnt", "-no", "SOURCE", "--target", str(esp)],
@@ -350,6 +362,7 @@ def main() -> int:
     writer.text(target / "entries.conf",
                 render_entries(modes, kernels, cfg["SPLASH_OPTIONS"], esp))
     writer.text(target / "refind.conf", render_config(cfg, scale, default.title))
+    systemd_boot_auto_entries(esp, cfg["SYSTEMD_BOOT_AUTO_ENTRIES"], writer)
     for path in writer.changed:
         log(("would update " if args.dry_run else "updated ") + path)
     if not writer.changed:
