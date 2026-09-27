@@ -1,0 +1,12 @@
+#!/bin/sh
+# Keep the QindaQt boot menu (rEFInd on the ESP) in step with the kernels:
+# runs after 90-loaderentry has written or removed the kernel's entry.
+case "$1" in
+    add|remove) ;;
+    *) exit 0 ;;
+esac
+command -v qinda-boot-sync >/dev/null 2>&1 || exit 0
+# Only once deployed (emerge --config sys-boot/qinda-boot does that).
+esp=$(bootctl --print-esp-path 2>/dev/null) || exit 0
+[ -d "$esp/EFI/qinda" ] || exit 0
+exec qinda-boot-sync --quiet

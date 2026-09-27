@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=QindaQt
+Description=QindaQt boot splash: the mark over the reclaimed palette, with boot progress
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/qindaqt
+ScriptFile=/usr/share/plymouth/themes/qindaqt/qindaqt.script

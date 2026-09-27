@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Deploy the QindaQt boot menu (rEFInd) to the EFI system partition.
+
+The menu is generated, never hand-edited: every installed kernel comes from
+the Boot Loader Specification entries that kernel-install writes to
+$ESP/loader/entries, and every menu row comes from a boot *mode* file in
+/usr/share/qinda-boot/modes.d (packages) or /etc/qinda-boot/modes.d (local
+overrides, same file name wins). Run by kernel-install after every kernel
+change and by sys-boot/qinda-boot's pkg_postinst/pkg_config.
+
+systemd-boot stays installed; the menu's "Advanced" row chains to it and the
+firmware falls back to it if this menu is ever missing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SHARE = Path(os.environ.get("QINDA_BOOT_SHARE", "/usr/share/qinda-boot"))
+ETC = Path(os.environ.get("QINDA_BOOT_ETC", "/etc/qinda-boot"))
+REFIND_EFI = Path("/usr/lib64/refind/refind/refind_x64.efi")
+ESP_DIR = "EFI/qinda"              # relative to the ESP root
+NVRAM_LABEL = "QindaQt"
+SYSTEMD_BOOT = "EFI/systemd/systemd-bootx64.efi"
+
+DEFAULTS = {
+    "TIMEOUT": "5",
+    "SCALE": "auto",
+    "DEFAULT_MODE": "qindaqt",
+    "SPLASH_OPTIONS": "quiet splash loglevel=3 rd.udev.log_level=3 systemd.show_status=auto rd.systemd.show_status=auto",
+    "RESOLUTION": "max",
+}
+
+QUIET = False
+
+
+def log(msg: str) -> None:
+    if not QUIET:
+        print(f"qinda-boot-sync: {msg}")
+
+
+def die(msg: str) -> None:
+    print(f"qinda-boot-sync: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ inputs --
+def read_kv(path: Path) -> dict[str, str]:
+    """Shell-style KEY=value lines (quotes allowed, # comments)."""
+    values: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        parts = shlex.split(value, comments=True)
+        values[key.strip()] = " ".join(parts)
+    return values
+
+
+@dataclass
+class Mode:
+    ident: str
+    title: str
+    icon: str
+    options: str = ""
+    order: int = 50
+
+
+def load_modes() -> list[Mode]:
+    files: dict[str, Path] = {}
+    for base in (SHARE / "modes.d", ETC / "modes.d"):
+        if base.is_dir():
+            for path in sorted(base.glob("*.conf")):
+                files[path.name] = path
+    modes = []
+    for name, path in sorted(files.items()):
+        kv = read_kv(path)
+        if kv.get("DISABLED", "").lower() in ("1", "yes", "true"):
+            continue
+        ident = re.sub(r"^\d+-", "", name[:-len(".conf")])
+        modes.append(Mode(
+            ident=ident,
+            title=kv.get("TITLE", ident),
+            icon=kv.get("ICON", ident),
+            options=kv.get("OPTIONS", ""),
+            order=int(kv.get("ORDER", name.split("-", 1)[0] if name[0].isdigit() else 50)),
+        ))
+    return sorted(modes, key=lambda m: (m.order, m.ident))
+
+
+@dataclass
+class Kernel:
+    version: str
+    title: str
+    linux: str
+    initrds: list[str] = field(default_factory=list)
+    options: str = ""
+
+
+def version_key(version: str) -> list:
+    return [(0, int(p)) if p.isdigit() else (1, p) for p in re.split(r"[.\-_+]", version)]
+
+
+def load_kernels(esp: Path) -> list[Kernel]:
+    kernels = []
+    for path in sorted((esp / "loader" / "entries").glob("*.conf")):
+        fields: dict[str, list[str]] = {}
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition(" ")
+            fields.setdefault(key, []).append(value.strip())
+        linux = fields.get("linux", [None])[0]
+        if not linux:
+            continue                  # UKIs, EFI chainloads: not ours to describe
+        kernels.append(Kernel(
+            version=fields.get("version", [path.stem])[0],
+            title=fields.get("title", ["Linux"])[0],
+            linux=linux,
+            initrds=fields.get("initrd", []),
+            options=" ".join(fields.get("options", [])),
+        ))
+    return sorted(kernels, key=lambda k: version_key(k.version), reverse=True)
+
+
+def detect_scale() -> int:
+    """2x artwork for displays wider than 1920 px, from connected DRM modes."""
+    widest = 0
+    for conn in Path("/sys/class/drm").glob("card*-*"):
+        try:
+            if (conn / "status").read_text().strip() != "connected":
+                continue
+            for mode in (conn / "modes").read_text().split():
+                widest = max(widest, int(mode.split("x")[0]))
+        except (OSError, ValueError):
+            continue
+    return 2 if widest > 1920 else 1
+
+
+def find_esp(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    try:
+        out = subprocess.run(["bootctl", "--print-esp-path"], capture_output=True,
+                             text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        die(f"cannot locate the EFI system partition ({exc}); pass --esp")
+    return Path(out)
+
+
+# ------------------------------------------------------------------ output --
+def q(text: str) -> str:
+    return '"' + text.replace('"', "'") + '"'
+
+
+def join_opts(*parts: str) -> str:
+    return " ".join(p for p in parts if p).strip()
+
+
+def efi_path(path: str) -> str:
+    return "/" + path.lstrip("/")
+
+
+def stanza(mode: Mode, kernels: list[Kernel], splash: str) -> str:
+    head = kernels[0]
+    icon = f"/{ESP_DIR}/theme/icons/os_{mode.icon}.png"
+    lines = [f"menuentry {q(mode.title)} {{",
+             f"    icon    {icon}",
+             f"    loader  {efi_path(head.linux)}"]
+    lines += [f"    initrd  {efi_path(i)}" for i in head.initrds]
+    lines.append(f"    options {q(join_opts(head.options, splash, mode.options))}")
+    lines.append(f"    submenuentry {q('Text boot (no splash)')} {{")
+    lines.append(f"        options {q(join_opts(head.options, mode.options))}")
+    lines.append("    }")
+    for old in kernels[1:]:
+        lines.append(f"    submenuentry {q('Kernel ' + old.version)} {{")
+        lines.append(f"        loader  {efi_path(old.linux)}")
+        lines += [f"        initrd  {efi_path(i)}" for i in old.initrds]
+        lines.append(f"        options {q(join_opts(old.options, splash, mode.options))}")
+        lines.append("    }")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def render_entries(modes: list[Mode], kernels: list[Kernel], splash: str, esp: Path) -> str:
+    out = ["# Generated by qinda-boot-sync from the kernel entries in /loader/entries",
+           "# and the boot modes in /usr/share/qinda-boot/modes.d. Do not edit.", ""]
+    for mode in modes:
+        out += [stanza(mode, kernels, splash), ""]
+    if (esp / SYSTEMD_BOOT).exists():
+        out += ["menuentry \"Advanced\" {",
+                f"    icon    /{ESP_DIR}/theme/icons/os_advanced.png",
+                f"    loader  /{SYSTEMD_BOOT}",
+                "}", ""]
+    return "\n".join(out)
+
+
+def render_config(cfg: dict[str, str], scale: int, default_title: str) -> str:
+    big, small = (320, 96) if scale == 2 else (160, 48)
+    return f"""# Generated by qinda-boot-sync (sys-boot/qinda-boot). Do not edit:
+# settings live in /etc/qinda-boot/qinda-boot.conf.
+timeout {cfg["TIMEOUT"]}
+use_nvram false
+scanfor manual
+showtools shutdown,reboot,firmware
+use_graphics_for linux
+hideui label,badges,arrows
+resolution {cfg["RESOLUTION"]}
+banner theme/background.png
+banner_scale fillscreen
+selection_big theme/selection_big.png
+selection_small theme/selection_small.png
+font theme/font.png
+icons_dir theme/icons
+big_icon_size {big}
+small_icon_size {small}
+default_selection {q(default_title)}
+include entries.conf
+"""
+
+
+class Writer:
+    def __init__(self, dry_run: bool) -> None:
+        self.dry_run = dry_run
+        self.changed: list[str] = []
+
+    def text(self, path: Path, content: str) -> None:
+        if path.exists() and path.read_text() == content:
+            return
+        self.changed.append(str(path))
+        if not self.dry_run:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".new")
+            tmp.write_text(content)
+            os.replace(tmp, path)
+
+    def copy(self, src: Path, dst: Path) -> None:
+        if dst.exists() and filecmp.cmp(src, dst, shallow=False):
+            return
+        self.changed.append(str(dst))
+        if not self.dry_run:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".new")
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+
+    def tree(self, src: Path, dst: Path) -> None:
+        wanted = set()
+        for path in sorted(src.rglob("*")):
+            if path.is_file():
+                rel = path.relative_to(src)
+                wanted.add(rel)
+                self.copy(path, dst / rel)
+        if dst.is_dir():
+            for path in sorted(dst.rglob("*"), reverse=True):
+                if path.is_file() and path.relative_to(dst) not in wanted:
+                    self.changed.append(f"removed {path}")
+                    if not self.dry_run:
+                        path.unlink()
+
+
+# ------------------------------------------------------------------- nvram --
+def esp_disk_part(esp: Path) -> tuple[str, str]:
+    source = subprocess.run(["findmnt", "-no", "SOURCE", "--target", str(esp)],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    name = Path(source).name
+    part = Path(f"/sys/class/block/{name}/partition").read_text().strip()
+    parent = Path(f"/sys/class/block/{name}").resolve().parent.name
+    return f"/dev/{parent}", part
+
+
+def install_nvram(esp: Path, dry_run: bool) -> None:
+    loader = "\\" + ESP_DIR.replace("/", "\\") + "\\refind_x64.efi"
+    listing = subprocess.run(["efibootmgr"], capture_output=True, text=True, check=True).stdout
+    order = re.search(r"^BootOrder: (\S+)", listing, re.M)
+    order_list = order.group(1).split(",") if order else []
+    ours = None
+    verbose = subprocess.run(["efibootmgr", "-v"], capture_output=True, text=True,
+                             check=True).stdout
+    for line in verbose.splitlines():
+        m = re.match(r"^Boot([0-9A-Fa-f]{4})\*? ", line)
+        if m and loader.lower() in line.lower():
+            ours = m.group(1).upper()
+    if ours is None:
+        disk, part = esp_disk_part(esp)
+        cmd = ["efibootmgr", "--quiet", "--create", "--disk", disk, "--part", part,
+               "--label", NVRAM_LABEL, "--loader", loader]
+        log("creating firmware boot entry: " + " ".join(cmd[2:]))
+        if dry_run:
+            return
+        subprocess.run(cmd, check=True)
+        listing = subprocess.run(["efibootmgr", "-v"], capture_output=True, text=True,
+                                 check=True).stdout
+        for line in listing.splitlines():
+            m = re.match(r"^Boot([0-9A-Fa-f]{4})\*? ", line)
+            if m and loader.lower() in line.lower():
+                ours = m.group(1).upper()
+        order = re.search(r"^BootOrder: (\S+)", listing, re.M)
+        order_list = order.group(1).split(",") if order else []
+    if ours is None:
+        die("the firmware did not keep the new boot entry")
+    new_order = [ours] + [b for b in order_list if b.upper() != ours]
+    if new_order != order_list:
+        log("boot order: " + ",".join(new_order))
+        if not dry_run:
+            subprocess.run(["efibootmgr", "--quiet", "--bootorder", ",".join(new_order)], check=True)
+
+
+# -------------------------------------------------------------------- main --
+def main() -> int:
+    global QUIET
+    parser = argparse.ArgumentParser(description="Deploy the QindaQt boot menu to the ESP.")
+    parser.add_argument("--esp", help="EFI system partition mount point (default: bootctl)")
+    parser.add_argument("--dry-run", action="store_true", help="show what would change")
+    parser.add_argument("--install-nvram", action="store_true",
+                        help="also register the menu with the firmware and boot it first")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    QUIET = args.quiet
+
+    esp = find_esp(args.esp)
+    cfg = dict(DEFAULTS)
+    if (ETC / "qinda-boot.conf").exists():
+        cfg.update(read_kv(ETC / "qinda-boot.conf"))
+    scale = detect_scale() if cfg["SCALE"] == "auto" else int(cfg["SCALE"].rstrip("x"))
+
+    kernels = load_kernels(esp)
+    if not kernels:
+        die(f"no kernel entries in {esp}/loader/entries; install a kernel first")
+    modes = load_modes()
+    if not modes:
+        die(f"no boot modes in {SHARE}/modes.d")
+    default = next((m for m in modes if m.ident == cfg["DEFAULT_MODE"]), modes[0])
+
+    target = esp / ESP_DIR
+    writer = Writer(args.dry_run)
+    writer.copy(REFIND_EFI, target / "refind_x64.efi")
+    writer.tree(SHARE / "refind" / f"{scale}x", target / "theme")
+    writer.text(target / "entries.conf",
+                render_entries(modes, kernels, cfg["SPLASH_OPTIONS"], esp))
+    writer.text(target / "refind.conf", render_config(cfg, scale, default.title))
+    for path in writer.changed:
+        log(("would update " if args.dry_run else "updated ") + path)
+    if not writer.changed:
+        log(f"{target} is current ({len(kernels)} kernel(s), {len(modes)} mode(s), {scale}x)")
+
+    if args.install_nvram:
+        install_nvram(esp, args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

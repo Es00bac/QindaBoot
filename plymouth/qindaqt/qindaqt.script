@@ -1,0 +1,145 @@
+# QindaQt boot splash (Plymouth script plugin).
+# Images come from tools/build_assets.py; sizes below are for a 1080-line
+# screen and scale with the display height.
+
+Window.SetBackgroundTopColor(0.086, 0.149, 0.153);     # #162627
+Window.SetBackgroundBottomColor(0.047, 0.082, 0.086);  # #0c1516
+
+sw = Window.GetWidth();
+sh = Window.GetHeight();
+ox = Window.GetX();
+oy = Window.GetY();
+unit = sh / 1080;
+if (unit < 0.5) unit = 0.5;
+if (unit > 3) unit = 3;
+cx = ox + sw / 2;
+cy = oy + sh / 2 - 40 * unit;
+
+fun scaled(path, width) {
+    local.img = Image(path);
+    local.h = width * img.GetHeight() / img.GetWidth();
+    return img.Scale(width, h);
+}
+
+fun centred(image, y, z) {
+    local.s = Sprite(image);
+    s.SetPosition(cx - image.GetWidth() / 2, y, z);
+    return s;
+}
+
+# The mark with a soft halo that breathes while the machine starts.
+glow_img = scaled("glow.png", 460 * unit);
+glow = centred(glow_img, cy - glow_img.GetHeight() / 2, 1);
+logo_img = scaled("logo.png", 176 * unit);
+logo = centred(logo_img, cy - logo_img.GetHeight() / 2, 3);
+
+word_img = scaled("wordmark.png", 210 * unit);
+word_y = cy + logo_img.GetHeight() / 2 + 34 * unit;
+word = centred(word_img, word_y, 3);
+
+mode = Plymouth.GetMode();
+if (mode == "shutdown") caption_file = "caption-shutdown.png";
+else if (mode == "reboot") caption_file = "caption-reboot.png";
+else if (mode == "updates" || mode == "system-upgrade" || mode == "firmware-upgrade")
+    caption_file = "caption-updates.png";
+else caption_file = "caption-boot.png";
+caption_img = Image(caption_file);
+caption_img = caption_img.Scale(caption_img.GetWidth() * 0.5 * unit, caption_img.GetHeight() * 0.5 * unit);
+caption_y = word_y + word_img.GetHeight() + 14 * unit;
+caption = centred(caption_img, caption_y, 3);
+
+# Progress: a slim rounded bar in the accent colour (boot and updates only).
+bar_w = 260 * unit;
+bar_h = Math.Int(4 * unit + 0.5);
+if (bar_h < 3) bar_h = 3;
+bar_x = cx - bar_w / 2;
+bar_y = caption_y + caption_img.GetHeight() + 30 * unit;
+track = Sprite(Image("progress-track.png").Scale(bar_w, bar_h));
+track.SetPosition(bar_x, bar_y, 3);
+fill_src = Image("progress-fill.png");
+fill = Sprite();
+fill.SetPosition(bar_x, bar_y, 4);
+shown = 0;
+if (mode == "shutdown" || mode == "reboot") {
+    track.SetOpacity(0);
+}
+
+fun progress_callback(duration, progress) {
+    # Never move backwards: Plymouth's estimate can dip on a slow step.
+    if (mode != "shutdown" && mode != "reboot" && progress > shown) {
+        shown = progress;
+        local.w = Math.Int(bar_w * shown);
+        if (w < bar_h) w = bar_h;
+        fill.SetImage(fill_src.Scale(w, bar_h));
+    }
+}
+Plymouth.SetBootProgressFunction(progress_callback);
+
+tick = 0;
+fun refresh_callback() {
+    tick = tick + 1;
+    local.phase = Math.Sin(tick / 22);
+    glow.SetOpacity(0.72 + 0.28 * phase);
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# Messages from systemd (fsck, emergency notices) under the bar.
+message = Sprite();
+fun message_callback(text) {
+    local.img = Image.Text(text, 0.765, 0.812, 0.710, 1, "Sans 12");
+    if (img) {
+        message.SetImage(img);
+        message.SetPosition(cx - img.GetWidth() / 2, bar_y + 40 * unit, 5);
+        message.SetOpacity(1);
+    }
+}
+Plymouth.SetMessageFunction(message_callback);
+
+# Passphrase prompts (encrypted volumes): a field with one bullet per key.
+entry_img = scaled("entry.png", 360 * unit);
+entry = Sprite(entry_img);
+entry.SetPosition(cx - entry_img.GetWidth() / 2, bar_y - 6 * unit, 6);
+entry.SetOpacity(0);
+bullet_img = scaled("bullet.png", 12 * unit);
+bullets = [];
+prompt = Sprite();
+
+fun hide_prompt() {
+    entry.SetOpacity(0);
+    prompt.SetOpacity(0);
+    for (i = 0; bullets[i]; i = i + 1) bullets[i].SetOpacity(0);
+    track.SetOpacity(1);
+    fill.SetOpacity(1);
+}
+
+fun password_callback(text, count) {
+    track.SetOpacity(0);
+    fill.SetOpacity(0);
+    entry.SetOpacity(1);
+    local.p = Image.Text(text, 0.969, 0.980, 0.929, 1, "Sans 12");
+    if (p) {
+        prompt.SetImage(p);
+        prompt.SetPosition(cx - p.GetWidth() / 2, bar_y - 18 * unit - p.GetHeight(), 6);
+        prompt.SetOpacity(1);
+    }
+    local.gap = bullet_img.GetWidth() * 1.6;
+    local.shown_n = count;
+    if (shown_n > 18) shown_n = 18;
+    local.left = cx - (shown_n * gap) / 2;
+    for (i = 0; i < shown_n || bullets[i]; i = i + 1) {
+        if (!bullets[i]) bullets[i] = Sprite(bullet_img);
+        if (i < shown_n) {
+            bullets[i].SetPosition(left + i * gap, bar_y - 6 * unit + (entry_img.GetHeight() - bullet_img.GetHeight()) / 2, 7);
+            bullets[i].SetOpacity(1);
+        } else {
+            bullets[i].SetOpacity(0);
+        }
+    }
+}
+Plymouth.SetDisplayPasswordFunction(password_callback);
+Plymouth.SetDisplayNormalFunction(hide_prompt);
+
+fun quit_callback() {
+    fill.SetImage(fill_src.Scale(bar_w, bar_h));
+}
+Plymouth.SetQuitFunction(quit_callback);
