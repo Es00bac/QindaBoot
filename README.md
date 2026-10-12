@@ -61,3 +61,17 @@ make check                              # unit tests + share/ is current
 rEFInd inverts its font over dark backgrounds, so the font strip is drawn in
 black. Its own entry label reads "Boot <title> from <volume>", so the menu
 hides it and each icon carries its caption.
+
+## License and provenance
+
+Original code authored for QindaBoot is released under the GNU General Public
+License, version 3 or (at your option) any later version
+(`GPL-3.0-or-later`). See [LICENSE](LICENSE) for the GPL version 3 text.
+Third-party components retain their own licenses and notices.
+
+The reused `art/reclaimed.png` wallpaper is the QindaQt Reclaimed artwork
+identified in [QindaThemes artwork provenance](https://github.com/Es00bac/QindaThemes/blob/main/docs/ARTWORK.md).
+It and the generated image/font assets retain their existing applicable terms;
+this code license does not newly relicense artwork or fonts. The generator
+uses separately installed Inter and IBM Plex Mono fonts; no font binaries are
+bundled here. rEFInd and Plymouth retain their respective upstream licenses.
